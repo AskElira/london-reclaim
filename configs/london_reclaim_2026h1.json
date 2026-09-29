@@ -1,0 +1,62 @@
+{
+  "strategy": {
+    "module": "backtester.strategy.london_reclaim",
+    "class_name": "LondonReclaimStrategy",
+    "params": {
+      "model": "breakout",
+      "trigger": "swing",
+      "bar_minutes": 1,
+      "london_session": "0200-0830",
+      "premarket_session": "0800-0930",
+      "am_session": "0930-1200",
+      "reference_levels": [
+        "london_extremes",
+        "pdh_pdl"
+      ],
+      "ny_exec_window": "0930-1100",
+      "pm_exec_window": "1330-1530",
+      "pm_require_intact": true,
+      "exit_eod_time": "1555",
+      "swing_bars": 3,
+      "max_wait_bars": 12,
+      "max_sl_pts": 45.0,
+      "max_contracts": 10,
+      "max_trades_per_day": 4,
+      "exit_model": "fixed",
+      "tp1_percent": 100.0,
+      "tp1_rr": 3.5,
+      "move_to_be_on_tp1": false,
+      "tp1_clamp_to_opposing": true,
+      "mss_exit_enabled": true,
+      "adr_filter_enabled": false,
+      "risk_per_trade_usd": 100.0,
+      "dyn_risk_enabled": false
+    }
+  },
+  "data": {
+    "parquet_root": "data/parquet",
+    "dataset_name": "mnq_ohlcv_1m",
+    "use_continuous": true
+  },
+  "execution": {
+    "slippage_ticks": 1.0,
+    "commission_per_side": 0.37
+  },
+  "topstep": {
+    "starting_balance": 50000.0,
+    "trailing_dd": 2000.0,
+    "phase1_target": 3000.0,
+    "phase2_target": 4000.0,
+    "trailing_lock_at_starting": true,
+    "force_flat_at_close": false
+  },
+  "window": {
+    "start": "2026-01-01T00:00:00+00:00",
+    "end": "2026-07-06T00:00:00+00:00"
+  },
+  "seed": 42,
+  "run_kind": "single",
+  "monte_carlo_runs": 200,
+  "monte_carlo_run_days": 180,
+  "monte_carlo_min_history_days": 10
+}

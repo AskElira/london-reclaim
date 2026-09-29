@@ -1,0 +1,361 @@
+//@version=6
+// London Reclaim - Variant A (breakout model, swing trigger)
+//
+// A TradingView port of `backtester.strategy.london_reclaim` as configured in
+// `examples/london_reclaim.json` ("The Compounder"). Run it on a 1-minute
+// Nasdaq futures chart (MNQ1! or NQ1!).
+//
+// WHAT IT DOES, in the engine's own order:
+//   1. Build four reference levels for the day: London high/low from the
+//      02:00-08:30 New York window, and the prior trading day's high/low taken
+//      on the 18:00 New York boundary, not midnight.
+//   2. A level is SWEPT when a bar trades beyond it. The sweep itself arms the
+//      setup - this is the expansion model, so the break is treated as real.
+//   3. Once armed, wait for a confirmed 3-bar fractal pullback swing. A buy
+//      stop is then placed one tick beyond the highest point of the break, with
+//      the stop loss one tick beyond that pullback swing.
+//   4. The order is only placed if it rests BEYOND the current price, if the
+//      distance to the stop loss is 45 points or less, and only during
+//      09:30-11:00 or 13:30-15:30 New York. In the afternoon window a level the
+//      morning already swept is skipped.
+//   5. Target is 3.5 times the risk. One trade per direction per level per day,
+//      four trades a day at most, everything flat at 15:55.
+//
+// WHAT IT WILL NOT DO: reproduce the backtest to the dollar. TradingView fills
+// on candle logic, the engine models slippage, commission and an OCO group in
+// which the stop wins a bar that touches both levels. Use this to SEE the
+// signals and levels, and the engine to measure them.
+
+strategy("London Reclaim - Variant A", overlay = true, initial_capital = 50000,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     pyramiding = 0, calc_on_every_tick = false,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.37)
+
+// ---------------------------------------------------------------- inputs
+TZ = "America/New_York"
+
+grpS = "Sessions (New York time)"
+londonSess = input.session("0200-0830", "London range",     group = grpS)
+nySess     = input.session("0930-1100", "Morning window",   group = grpS)
+pmSess     = input.session("1330-1530", "Afternoon window", group = grpS)
+flatTime   = input.session("1555-1600", "Flatten by",       group = grpS)
+pmIntact   = input.bool(true, "Afternoon skips a level the morning already swept", group = grpS)
+
+grpR = "Risk and targets"
+swingBars    = input.int(3,     "Pullback swing, bars each side", minval = 1, group = grpR)
+maxSlPts     = input.float(45.0,"Maximum stop distance, points",  minval = 1, group = grpR)
+tpRR         = input.float(3.5, "Target, multiples of risk",      minval = 0.1, group = grpR)
+maxWaitBars  = input.int(12,    "Cancel an unfilled order after N bars", minval = 1, group = grpR)
+maxTradesDay = input.int(4,     "Maximum trades per day",         minval = 1, group = grpR)
+slOffTicks   = input.float(1.0, "Stop offset, ticks",             minval = 0, group = grpR)
+
+grpL = "Levels"
+useLondon = input.bool(true, "London high / low",     group = grpL)
+usePd     = input.bool(true, "Prior day high / low",  group = grpL)
+showLines = input.bool(true, "Draw today's levels",   group = grpL)
+showZones = input.bool(true, "Shade the trading windows", group = grpL)
+
+// ---------------------------------------------------------------- clocks
+inLondon = not na(time(timeframe.period, londonSess + ":1234567", TZ))
+inNY     = not na(time(timeframe.period, nySess     + ":1234567", TZ))
+inPM     = not na(time(timeframe.period, pmSess     + ":1234567", TZ))
+inFlat   = not na(time(timeframe.period, flatTime   + ":1234567", TZ))
+inExec   = inNY or inPM
+
+// The engine resets its per-day state on the New York CALENDAR date, and rolls
+// the prior-day high/low on the 18:00 trading-day boundary. Both are needed.
+calDay  = dayofmonth(time, TZ) + 100 * month(time, TZ) + 10000 * year(time, TZ)
+tdStamp = time + 6 * 60 * 60 * 1000
+tdDay   = dayofmonth(tdStamp, TZ) + 100 * month(tdStamp, TZ) + 10000 * year(tdStamp, TZ)
+newCal  = ta.change(calDay) != 0
+newTd   = ta.change(tdDay) != 0
+
+// ------------------------------------------------------- prior trading day
+var float tdHi = na
+var float tdLo = na
+var float pdh  = na
+var float pdl  = na
+if newTd
+    pdh := tdHi
+    pdl := tdLo
+    tdHi := high
+    tdLo := low
+else
+    tdHi := na(tdHi) ? high : math.max(tdHi, high)
+    tdLo := na(tdLo) ? low  : math.min(tdLo, low)
+
+// ------------------------------------------------------------ London range
+var float lonHi = na
+var float lonLo = na
+var bool  lonLocked = false
+if newCal
+    lonHi := na
+    lonLo := na
+    lonLocked := false
+if inLondon
+    lonHi := na(lonHi) ? high : math.max(lonHi, high)
+    lonLo := na(lonLo) ? low  : math.min(lonLo, low)
+if not inLondon and inLondon[1]
+    lonLocked := true
+
+// --------------------------------------------------------- pullback swings
+// A fractal is only confirmed `swingBars` bars later, so `ta.pivotlow` returns
+// it at the right time by construction. Nothing here reads an unconfirmed bar.
+pvLo = ta.pivotlow(low, swingBars, swingBars)
+pvHi = ta.pivothigh(high, swingBars, swingBars)
+var float lastSwLo    = na
+var int   lastSwLoBar = na
+var float lastSwHi    = na
+var int   lastSwHiBar = na
+if not na(pvLo)
+    lastSwLo := pvLo
+    lastSwLoBar := bar_index - swingBars
+if not na(pvHi)
+    lastSwHi := pvHi
+    lastSwHiBar := bar_index - swingBars
+
+// ------------------------------------------------------------- day counters
+var int tradesToday = 0
+if newCal
+    tradesToday := 0
+
+// --------------------------------------------------------- per-level state
+// Two reference levels, each tracked with the same six pieces of state. Arrays
+// keep the logic written once rather than copied per level.
+var array<float> srcHi     = array.new<float>(2, na)
+var array<float> srcLo     = array.new<float>(2, na)
+var array<bool>  srcOn     = array.new<bool>(2, false)
+var array<bool>  sweptHi   = array.new<bool>(2, false)
+var array<bool>  sweptLo   = array.new<bool>(2, false)
+var array<float> sweepHiPx = array.new<float>(2, na)
+var array<float> sweepLoPx = array.new<float>(2, na)
+var array<int>   armLong   = array.new<int>(2, na)
+var array<int>   armShort  = array.new<int>(2, na)
+var array<bool>  tookLong  = array.new<bool>(2, false)
+var array<bool>  tookShort = array.new<bool>(2, false)
+var array<bool>  brokenAm  = array.new<bool>(2, false)
+
+if newCal
+    for i = 0 to 1
+        array.set(sweptHi, i, false)
+        array.set(sweptLo, i, false)
+        array.set(sweepHiPx, i, na)
+        array.set(sweepLoPx, i, na)
+        array.set(armLong, i, na)
+        array.set(armShort, i, na)
+        array.set(tookLong, i, false)
+        array.set(tookShort, i, false)
+        array.set(brokenAm, i, false)
+        array.set(srcOn, i, false)
+
+// Level 0 = London, level 1 = prior day. Each becomes usable the moment its
+// range is locked, never before.
+if lonLocked and useLondon
+    array.set(srcHi, 0, lonHi)
+    array.set(srcLo, 0, lonLo)
+    array.set(srcOn, 0, true)
+if not na(pdh) and usePd
+    array.set(srcHi, 1, pdh)
+    array.set(srcLo, 1, pdl)
+    array.set(srcOn, 1, true)
+
+// The afternoon rule needs to know what the morning did, so the flag is frozen
+// when the morning window closes.
+if not inNY and inNY[1]
+    for i = 0 to 1
+        array.set(brokenAm, i, array.get(sweptHi, i) or array.get(sweptLo, i))
+
+// ------------------------------------------------------------------ sweeps
+for i = 0 to 1
+    if array.get(srcOn, i)
+        hiLvl = array.get(srcHi, i)
+        loLvl = array.get(srcLo, i)
+        if not na(hiLvl) and high > hiLvl
+            if not array.get(sweptHi, i)
+                array.set(sweptHi, i, true)
+                array.set(armLong, i, bar_index)
+            px = array.get(sweepHiPx, i)
+            array.set(sweepHiPx, i, na(px) ? high : math.max(px, high))
+        if not na(loLvl) and low < loLvl
+            if not array.get(sweptLo, i)
+                array.set(sweptLo, i, true)
+                array.set(armShort, i, bar_index)
+            px = array.get(sweepLoPx, i)
+            array.set(sweepLoPx, i, na(px) ? low : math.min(px, low))
+
+// --------------------------------------------------------------- the setup
+tick = syminfo.mintick
+off  = slOffTicks * tick
+
+var float pendEntry = na
+var float pendStop  = na
+var float pendTgt   = na
+var int   pendBar   = na
+var int   pendSrc   = na
+var bool  pendLong  = true
+
+flatNow  = strategy.position_size == 0
+canTrade = inExec and not inFlat and flatNow and na(pendEntry) and tradesToday < maxTradesDay
+
+if canTrade
+    for i = 0 to 1
+        if na(pendEntry) and array.get(srcOn, i)
+            // The afternoon does not trade a level the morning already took out.
+            skip = inPM and pmIntact and array.get(brokenAm, i)
+            if not skip
+                // Long: the break is up, the pullback is a swing LOW, and the
+                // buy stop sits one tick above the highest point of the break.
+                aL = array.get(armLong, i)
+                if not array.get(tookLong, i) and not na(aL) and not na(lastSwLoBar) and lastSwLoBar >= aL
+                    ext = array.get(sweepHiPx, i)
+                    e = na(ext) ? na : ext + tick
+                    s = lastSwLo - off
+                    if not na(e) and e > close and (e - s) > 0 and (e - s) <= maxSlPts
+                        pendEntry := e
+                        pendStop  := s
+                        pendTgt   := e + tpRR * (e - s)
+                        pendBar   := bar_index
+                        pendSrc   := i
+                        pendLong  := true
+                // Short is the mirror image: break down, pullback swing HIGH,
+                // sell stop one tick below the lowest point of the break.
+                aS = array.get(armShort, i)
+                if na(pendEntry) and not array.get(tookShort, i) and not na(aS) and not na(lastSwHiBar) and lastSwHiBar >= aS
+                    extS = array.get(sweepLoPx, i)
+                    eS = na(extS) ? na : extS - tick
+                    sS = lastSwHi + off
+                    if not na(eS) and eS < close and (sS - eS) > 0 and (sS - eS) <= maxSlPts
+                        pendEntry := eS
+                        pendStop  := sS
+                        pendTgt   := eS - tpRR * (sS - eS)
+                        pendBar   := bar_index
+                        pendSrc   := i
+                        pendLong  := false
+
+// ------------------------------------------------------------------ orders
+if not na(pendEntry) and strategy.position_size == 0
+    if pendLong
+        strategy.entry("L", strategy.long, stop = pendEntry)
+    else
+        strategy.entry("S", strategy.short, stop = pendEntry)
+
+// An order that has not filled dies, exactly as it does in the engine: after
+// `maxWaitBars`, when the execution window closes, or when the OPPOSITE side of
+// the same level is swept, which invalidates the idea outright.
+oppSwept = na(pendSrc) ? false : pendLong ? array.get(sweptLo, pendSrc) : array.get(sweptHi, pendSrc)
+expired  = not na(pendBar) and (bar_index - pendBar) >= maxWaitBars
+if not na(pendEntry) and strategy.position_size == 0 and (expired or not inExec or oppSwept or inFlat)
+    strategy.cancel("L")
+    strategy.cancel("S")
+    pendEntry := na
+    pendStop  := na
+    pendTgt   := na
+    pendBar   := na
+    pendSrc   := na
+
+justFilled = strategy.position_size != 0 and strategy.position_size[1] == 0
+if justFilled
+    tradesToday += 1
+    if not na(pendSrc)
+        if pendLong
+            array.set(tookLong, pendSrc, true)
+        else
+            array.set(tookShort, pendSrc, true)
+
+if strategy.position_size > 0
+    strategy.exit("x", from_entry = "L", stop = pendStop, limit = pendTgt)
+if strategy.position_size < 0
+    strategy.exit("x", from_entry = "S", stop = pendStop, limit = pendTgt)
+
+if inFlat and strategy.position_size != 0
+    strategy.close_all(comment = "EOD flat")
+
+wentFlat = strategy.position_size == 0 and strategy.position_size[1] != 0
+if wentFlat
+    pendEntry := na
+    pendStop  := na
+    pendTgt   := na
+    pendBar   := na
+    pendSrc   := na
+
+// ------------------------------------------------------------- the drawing
+// Every line and label belongs to ONE trading day and is deleted when the next
+// one starts. A chart carrying last week's levels is worse than no levels: it
+// invites you to trade a line nobody is watching any more.
+var array<line>  dayLines  = array.new<line>()
+var array<label> dayLabels = array.new<label>()
+
+wipe() =>
+    if array.size(dayLines) > 0
+        for i = 0 to array.size(dayLines) - 1
+            line.delete(array.get(dayLines, i))
+        array.clear(dayLines)
+    if array.size(dayLabels) > 0
+        for i = 0 to array.size(dayLabels) - 1
+            label.delete(array.get(dayLabels, i))
+        array.clear(dayLabels)
+
+if newCal
+    wipe()
+
+drawLevel(float price, color col, string txt, int style) =>
+    if showLines and not na(price)
+        ln = line.new(time, price, time + 24 * 60 * 60 * 1000, price,
+             xloc = xloc.bar_time, color = col, width = 1, style = style)
+        array.push(dayLines, ln)
+        lb = label.new(time + 24 * 60 * 60 * 1000, price, txt, xloc = xloc.bar_time,
+             style = label.style_label_left, color = color.new(col, 85),
+             textcolor = col, size = size.small)
+        array.push(dayLabels, lb)
+
+// London levels are drawn the moment the window closes and they are final.
+if lonLocked and not lonLocked[1]
+    drawLevel(lonHi, color.new(color.orange, 0), "London H", line.style_solid)
+    drawLevel(lonLo, color.new(color.orange, 0), "London L", line.style_solid)
+
+// Prior-day levels are drawn once the new trading day begins.
+if newCal and not na(pdh)
+    drawLevel(pdh, color.new(color.blue, 0), "PDH", line.style_dashed)
+    drawLevel(pdl, color.new(color.blue, 0), "PDL", line.style_dashed)
+
+// The live trade's own three lines, drawn at the fill and cleared when flat.
+var line lnEntry = na
+var line lnStop  = na
+var line lnTgt   = na
+clearTrade() =>
+    if not na(lnEntry)
+        line.delete(lnEntry)
+    if not na(lnStop)
+        line.delete(lnStop)
+    if not na(lnTgt)
+        line.delete(lnTgt)
+    lnEntry := na
+    lnStop  := na
+    lnTgt   := na
+
+if justFilled
+    lnEntry := line.new(bar_index, strategy.position_avg_price, bar_index + 60,
+         strategy.position_avg_price, color = color.gray, style = line.style_dotted)
+    lnStop  := line.new(bar_index, pendStop, bar_index + 60, pendStop,
+         color = color.red, style = line.style_dotted)
+    lnTgt   := line.new(bar_index, pendTgt, bar_index + 60, pendTgt,
+         color = color.green, style = line.style_dotted)
+if wentFlat or newCal
+    clearTrade()
+
+// ---------------------------------------------------------------- markers
+plotshape(justFilled and strategy.position_size > 0, title = "BUY",
+     style = shape.labelup, location = location.belowbar, color = color.new(color.teal, 0),
+     textcolor = color.white, text = "BUY", size = size.small)
+plotshape(justFilled and strategy.position_size < 0, title = "SELL",
+     style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0),
+     textcolor = color.white, text = "SELL", size = size.small)
+plotshape(wentFlat, title = "EXIT", style = shape.xcross, location = location.abovebar,
+     color = color.new(color.gray, 0), size = size.tiny)
+
+bgcolor(showZones and inLondon ? color.new(color.orange, 94) : na, title = "London range")
+bgcolor(showZones and inNY     ? color.new(color.teal,   94) : na, title = "Morning window")
+bgcolor(showZones and inPM     ? color.new(color.purple, 94) : na, title = "Afternoon window")
+
+alertcondition(justFilled and strategy.position_size > 0, "Variant A BUY",  "London Reclaim: BUY signal")
+alertcondition(justFilled and strategy.position_size < 0, "Variant A SELL", "London Reclaim: SELL signal")
