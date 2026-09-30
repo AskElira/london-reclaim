@@ -8,6 +8,8 @@ An MNQ / NQ futures strategy: **London and previous-day levels, breakout, then r
 
 Backtest on MNQ, 1-minute bars, $100 risk per trade, 1 tick slippage, $0.37 commission per side, $50,000 start.
 
+Compounding version: `configs/london_reclaim_compound.json` risks 1.5% of current balance per trade (`risk_pct_equity`), starts at $6,000, window 2021-08-24 to 2026-08-21. Result: $39,581, 860 trades. Contracts = `int(risk / (stop points × $2))`, skipped if below 1, capped at 10.
+
 | Period | Trades | Profit factor | Sharpe | Win rate | Max drawdown |
 | --- | --- | --- | --- | --- | --- |
 | **Full, 2019-05 to 2026-08** | 1,367 | 1.26 | 1.44 | 32% | $2,107 |
