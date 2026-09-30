@@ -35,10 +35,23 @@ Limits you should know:
 ## Files
 
 - `strategy/london_reclaim.py`: the full strategy logic (Python, event-driven).
-- `pine/london_reclaim_variant_a.pine`: TradingView version. Run it on a 1-minute MNQ or NQ chart to **see** the levels and signals. It will not match the backtest to the dollar.
+- `pine/london_reclaim_variant_a.pine`: TradingView version. **Run it on a 1-minute MNQ or NQ chart** (it stops with an error on any other timeframe). It follows the same window, sweep, swing, sizing, and slippage rules as the Python file. See "Pine parity" below for what is and is not proven.
 - `configs/`: the exact parameters behind the table. `lr_insample.json`, `lr_oos_pre.json`, `lr_oos_post.json` are the three periods. `lr_full_slip2.json`, `lr_full_slip3.json`, `lr_full_comm2x.json` are cost stress tests.
 
 The Python file needs an event-driven backtesting engine that supplies `Bar`, `Order`, and a strategy base class. The engine is not part of this repo.
+
+## Pine parity
+
+I ported the Pine logic line by line into Python and ran it over the same 1-minute data as the backtest (2019-05-06 to 2026-08-24, slippage set to 0 for both).
+
+- **Fixed Pine rules: 1,367 of 1,367 trades identical** to the Python strategy. Same side, entry time, entry price, stop, target, size, exit time, and exit price.
+- **Earlier Pine rules** (sweeps counted all day, no reset at each window start): 1,669 trades, and only 56% matched. Those rules were wrong, and they are fixed.
+
+What this does **not** prove:
+
+- The test checks the *logic port*, not TradingView itself. I could not compile or run the Pine file in TradingView here. Compile it first and expect small fixes.
+- TradingView's broker emulator can order a stop and a target in the same bar differently from the backtest, which assumes the stop is hit first. Real TradingView trades can differ from the table above for this reason.
+- Sizing uses risk of $100 per trade at $2 a point (MNQ). On NQ the size rounds to zero, so raise the risk input.
 
 ## License
 
